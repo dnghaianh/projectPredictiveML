@@ -1,0 +1,727 @@
+---
+title: "Assignment 2-Group project"
+author: "Hai Huynh, Nguyen Do, Han Nguyen, Lam Huynh"
+date: "2026-05-14"
+output: html_document
+---
+
+LOAD
+
+```{r}
+library(tidyverse)
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+library(pROC)
+library(corrplot)
+library(scales)
+df <- read.csv("nsduh_assignment2_core.csv", stringsAsFactors = FALSE)
+```
+
+FILTER only required years and age categories
+
+```{r}
+df <- df %>%
+  filter(year %in% c(2021, 2022, 2023),
+         age_cat %in% c(1, 4))
+```
+
+DATA CLEANING
+
+Response Variable
+
+```{r}
+df <- df %>% filter(!is.na(mde_past_year))
+df$mde_past_year <- factor(df$mde_past_year, levels = c(0, 1), labels = c("No", "Yes"))
+```
+
+```{r}
+# 94 = DON'T KNOW, 97 = REFUSED → recode as NA    
+df$self_rated_health[df$self_rated_health %in% c(94, 97)] <- NA
+df$self_rated_health <- factor(df$self_rated_health, levels = 1:5,
+                                labels = c("Excellent","Very Good","Good","Fair","Poor"))
+ 
+# --- employment ---
+# 99 = 12-14 year olds (valid age group in age_cat=1); keep as its own level
+df$employment <- factor(df$employment, levels = c(1, 2, 3, 4, 99),
+                        labels = c("Full time","Part time","Unemployed","Other","Age 12-14"))
+ 
+# --- income ---
+df$income <- factor(df$income, levels = 1:4,
+                    labels = c("<$20k","$20k-$49k","$50k-$74k","$75k+"))
+ 
+# --- alcohol_consumption ---
+df$alcohol_consumption <- factor(df$alcohol_consumption, levels = 1:6,
+                                 labels = c("1-11 days","12-49 days","50-99 days",
+                                            "100-299 days","300-365 days","Non-user"))
+ 
+# --- risk_lsd_try ---
+# 85 = BAD DATA, 94 = DON'T KNOW, 97 = REFUSED, 98 = BLANK → NA
+df$risk_lsd_try[df$risk_lsd_try %in% c(85, 94, 97, 98)] <- NA
+df$risk_lsd_try <- factor(df$risk_lsd_try, levels = 1:4,
+                           labels = c("No risk","Slight risk","Moderate risk","Great risk"))
+ 
+# --- ease_get_lsd ---
+# 85/94/97/98 → NA
+df$ease_get_lsd[df$ease_get_lsd %in% c(85, 94, 97, 98)] <- NA
+df$ease_get_lsd <- factor(df$ease_get_lsd, levels = 1:5,
+                           labels = c("Impossible","Very difficult","Fairly difficult","Fairly easy","Very easy"))
+ 
+# --- hallucinogen_age_first ---
+# 991 = never used (valid, keep as-is); 994/997/998 = unknown → NA
+# 994/997/998 = unknown → NA
+df$hallucinogen_age_first[df$hallucinogen_age_first %in% c(994, 997, 998)] <- NA
+
+# 991 = never used → meaningful label, keeping real ages as-is
+df$hallucinogen_age_first <- ifelse(df$hallucinogen_age_first == 991, "Never used", as.character(df$hallucinogen_age_first)
+)
+df$hallucinogen_age_first <- factor(df$hallucinogen_age_first)
+# Note: 991 is intentionally kept — it means "never used hallucinogens"
+ 
+# --- drove_on_hallucinogens ---
+# 1=Yes, 2=No; 85/94/97/98 → NA (none present in filtered data but defensive coding)
+df$drove_on_hallucinogens[df$drove_on_hallucinogens %in% c(85, 94, 97, 98)] <- NA
+df$drove_on_hallucinogens <- factor(df$drove_on_hallucinogens,
+                                     levels = c(1, 2), labels = c("Yes", "No"))
+ 
+# --- Binary/factor conversions ---
+df$sex_f                  <- factor(df$sex_f)
+df$hallucinogen_past_year <- factor(df$hallucinogen_past_year, levels = c(0,1), labels = c("No","Yes"))
+df$lsd_ever               <- factor(df$lsd_ever, levels = c(0,1), labels = c("No","Yes"))
+df$lsd_past_year          <- factor(df$lsd_past_year, levels = c(0,1), labels = c("No","Yes"))
+df$psilocybin_ever        <- factor(df$psilocybin_ever, levels = c(0,1), labels = c("No","Yes"))
+df$alcohol_lastmonth      <- factor(df$alcohol_lastmonth, levels = c(0,1), labels = c("No","Yes"))
+df$age_cat                <- factor(df$age_cat, levels = c(1, 4), labels = c("12-17","35+"))
+df$hallucinogen_days_year <- factor(df$hallucinogen_days_year, levels = 1:6,labels = c("1-11 days","12-49 days","50-99 days","100-299 days","300-365 days","Non-user"))
+df$year <- factor(df$year)
+ 
+cat("Rows after removing missing response:", nrow(df), "\n")
+cat("MDE prevalence:\n")
+print(prop.table(table(df$mde_past_year)))
+```
+
+1.  Missing Data
+
+```{r}
+cat("\n--- Missing Data Summary ---\n")
+missing_summary <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Pct = round(Missing_Count / nrow(df) * 100, 1)) %>%
+  filter(Missing_Count > 0) %>%
+  arrange(desc(Missing_Count))
+ 
+print(missing_summary)
+ 
+# Plot: Missing data
+ggplot(missing_summary, aes(x = reorder(Variable, Missing_Pct), y = Missing_Pct)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Missing Data by Variable",
+       x = NULL, y = "% Missing") +
+  theme_minimal()
+```
+
+2.  RESPONSE VARIABLE: CLASS BALANCE
+
+```{r}
+cat("\n--- MDE Class Balance ---\n")
+mde_table <- df %>%
+  count(mde_past_year) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+print(mde_table)
+ 
+# Plot: Class balance
+ggplot(mde_table, aes(x = mde_past_year, y = n, fill = mde_past_year)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(title = "Class Distribution of Major Depressive Episode (MDE)",
+       subtitle = "Note the class imbalance — MDE cases are the minority",
+       x = "MDE Past Year", y = "Count") +
+  theme_minimal()
+ 
+```
+
+--\> use AUC and F1 over accuracy
+
+MDE Rate
+
+```{r}
+mde_rate <- function(data, var) {
+  data %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(across(all_of(var))) %>%
+    summarise(n    = n(),
+              rate = mean(mde_past_year == "Yes"),
+              se   = sqrt(rate * (1 - rate) / n),
+              .groups = "drop") %>%
+    mutate(lower = pmax(0, rate - 1.96 * se),
+           upper = pmin(1, rate + 1.96 * se),
+           label = paste0(round(rate * 100, 1), "%"))
+}
+```
+
+3.  MDE Rate by Age Group
+
+```{r}
+
+mde_rate(df, "age_cat") %>%
+  ggplot(aes(x = age_cat, y = rate, fill = age_cat)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.8, size = 4) +
+  scale_fill_manual(values = c("steelblue","tomato")) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Plot 3: MDE Rate by Age Group",
+       x = "Age Group", y = "MDE Rate") +
+  theme_minimal()
+```
+
+4.  MDE Rate by Sex
+
+```{r}
+mde_rate(df, "sex_f") %>%
+  ggplot(aes(x = sex_f, y = rate, fill = sex_f)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.8, size = 4) +
+  scale_fill_manual(values = c("steelblue","tomato")) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Plot 4: MDE Rate by Sex",
+       x = "Sex", y = "MDE Rate") +
+  theme_minimal()
+```
+
+5.  MDE Rate by Age Group and Sex (interaction)
+
+```{r}
+df %>%
+  group_by(age_cat, sex_f) %>%
+  summarise(rate = mean(mde_past_year == "Yes"), .groups = "drop") %>%
+  ggplot(aes(x = age_cat, y = rate, fill = sex_f)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = paste0(round(rate * 100, 1), "%")),
+            position = position_dodge(0.6), vjust = -0.5, size = 3.5) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("steelblue","tomato")) +
+  labs(title = "Plot 5: MDE Rate by Age Group and Sex",
+       x = "Age Group", y = "MDE Rate", fill = "Sex") +
+  theme_minimal()
+```
+
+PLOT 6 — MDE Rate by Self-Rated Health
+
+```{r}
+mde_rate(df, "self_rated_health") %>%
+  ggplot(aes(x = self_rated_health, y = rate, group = 1)) +
+  geom_line(colour = "steelblue", linewidth = 1.2) +
+  geom_point(colour = "steelblue", size = 3) +
+  geom_text(aes(label = label), vjust = -1, size = 3.5) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0.05, 0.2))) +
+  labs(title = "Plot 6: MDE Rate by Self-Rated Health",
+       x = "Self-Rated Health", y = "MDE Rate") +
+  theme_minimal()
+```
+
+PLOT 7 — MDE Rate by Hallucinogen Use Past Year
+
+```{r}
+mde_rate(df, "hallucinogen_past_year") %>%
+  ggplot(aes(x = hallucinogen_past_year, y = rate, fill = hallucinogen_past_year)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.8, size = 4) +
+  scale_fill_manual(values = c("steelblue","tomato")) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Plot 7: MDE Rate by Hallucinogen Use (Past Year)",
+       x = "Used Hallucinogens Past Year", y = "MDE Rate") +
+  theme_minimal()
+```
+
+PLOT 8 — MDE Rate by Income
+
+```{r}
+mde_rate(df, "income") %>%
+  ggplot(aes(x = income, y = rate, fill = income)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.8, size = 3.5) +
+  scale_fill_brewer(palette = "Blues", direction = -1) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Plot 8: MDE Rate by Income Level",
+       x = "Income", y = "MDE Rate") +
+  theme_minimal()
+```
+
+PLOT 9 — MDE Rate by Perceived Risk of Trying LSD
+
+```{r}
+mde_rate(df, "risk_lsd_try") %>%
+  ggplot(aes(x = risk_lsd_try, y = rate, group = 1)) +
+  geom_line(colour = "tomato", linewidth = 1.2) +
+  geom_point(colour = "tomato", size = 3) +
+  geom_text(aes(label = label), vjust = -1, size = 3.5) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0.05, 0.2))) +
+  labs(title = "Plot 9: MDE Rate by Perceived Risk of Trying LSD",
+       x = "Perceived Risk", y = "MDE Rate") +
+  theme_minimal()
+ 
+```
+
+PLOT 10 — MDE Rate by Employment
+
+```{r}
+mde_rate(df, "employment") %>%
+  ggplot(aes(x = employment, y = rate, fill = employment)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.8, size = 3.5) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Plot 10: MDE Rate by Employment Status",
+       x = "Employment Status", y = "MDE Rate") +
+  theme_minimal()
+```
+
+PLOT 11 — MDE Rate Over Time
+
+```{r}
+mde_rate(df, "year") %>%
+  ggplot(aes(x = year, y = rate, group = 1)) +
+  geom_line(colour = "steelblue", linewidth = 1.2) +
+  geom_point(colour = "steelblue", size = 3) +
+  geom_text(aes(label = label), vjust = -1, size = 3.5) +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0.05, 0.2))) +
+  labs(title = "Plot 11: MDE Rate Over Time (2021-2023)",
+       x = "Year", y = "MDE Rate") +
+  theme_minimal()
+ 
+```
+
+# MODELS
+
+### Ridge Regression
+
+```{r}
+library(glmnet)
+library(caret)
+library(pROC)
+
+set.seed(123)
+
+
+
+# 1. TRAIN / TEST SPLIT (80/20)
+
+
+train_idx <- sample(nrow(df), size = 0.8 * nrow(df))
+train_df  <- df[train_idx, ]
+test_df   <- df[-train_idx, ]
+
+cat("Train size:", nrow(train_df), "\n")
+cat("Test size: ", nrow(test_df),  "\n")
+
+
+# =============================================================================
+# 2. IMPUTE REMAINING NAs
+# glmnet cannot handle NAs — fill with median (numeric) or mode (factor)
+# =============================================================================
+
+impute <- function(x) {
+  if (is.factor(x)) {
+    mode_val <- names(sort(table(x), decreasing = TRUE))[1]
+    x[is.na(x)] <- mode_val
+  } else {
+    x[is.na(x)] <- median(x, na.rm = TRUE)
+  }
+  x
+}
+
+train_imp <- train_df %>% mutate(across(everything(), impute))
+test_imp  <- test_df  %>% mutate(across(everything(), impute))
+
+
+# =============================================================================
+# 3. MODEL MATRIX
+# Converts factors to dummy variables — required by glmnet
+# Done separately on train and test to avoid data leakage
+# =============================================================================
+
+X_train <- model.matrix(mde_past_year ~ . - 1, data = train_imp)
+X_test  <- model.matrix(mde_past_year ~ . - 1, data = test_imp)
+
+y_train <- train_imp$mde_past_year
+y_test  <- test_imp$mde_past_year
+
+
+# =============================================================================
+# 4. CROSS-VALIDATION TO SELECT LAMBDA
+# alpha = 0 → Ridge (L2 penalty)
+# 10-fold CV optimising for AUC
+# =============================================================================
+
+cv_ridge <- cv.glmnet(
+  x            = X_train,
+  y            = y_train,
+  family       = "binomial",
+  alpha        = 0,
+  nfolds       = 10,
+  type.measure = "auc"
+)
+
+lambda_best <- cv_ridge$lambda.min   # lambda with best CV AUC
+lambda_1se  <- cv_ridge$lambda.1se   # slightly more regularised, often preferred
+
+cat("\nBest lambda (min):  ", round(lambda_best, 6), "\n")
+cat("Lambda 1SE:          ", round(lambda_1se,  6), "\n")
+
+# Plot 1: CV curve — AUC vs log(lambda)
+plot(cv_ridge, main = "Ridge CV: AUC vs log(Lambda)")
+
+
+# =============================================================================
+# 5. FIT FINAL MODEL using lambda.1se
+# =============================================================================
+
+ridge_model <- glmnet(
+  x      = X_train,
+  y      = y_train,
+  family = "binomial",
+  alpha  = 0,
+  lambda = lambda_1se
+)
+
+# Plot 2: Coefficient shrinkage paths
+plot(glmnet(X_train, y_train, family = "binomial", alpha = 0),
+     xvar = "lambda", label = FALSE,
+     main = "Ridge: Coefficient Paths vs log(Lambda)")
+abline(v = log(lambda_1se), lty = 2, col = "red")
+legend("topright", legend = "Selected lambda (1SE)", lty = 2, col = "red")
+
+
+# =============================================================================
+# 6. PREDICTIONS
+# =============================================================================
+
+prob_train <- predict(ridge_model, newx = X_train, type = "response")[, 1]
+prob_test  <- predict(ridge_model, newx = X_test,  type = "response")[, 1]
+
+pred_train <- factor(ifelse(prob_train >= 0.5, "Yes", "No"), levels = c("No","Yes"))
+pred_test  <- factor(ifelse(prob_test  >= 0.5, "Yes", "No"), levels = c("No","Yes"))
+
+
+# =============================================================================
+# 7. PERFORMANCE METRICS
+# =============================================================================
+
+cat("\n=== IN-SAMPLE (Train) ===\n")
+cm_train <- confusionMatrix(pred_train, y_train, positive = "Yes")
+print(cm_train)
+
+cat("\n=== OUT-OF-SAMPLE (Test) ===\n")
+cm_test <- confusionMatrix(pred_test, y_test, positive = "Yes")
+print(cm_test)
+
+# AUC
+roc_train <- roc(y_train, prob_train, levels = c("No","Yes"), direction = "<", quiet = TRUE)
+roc_test  <- roc(y_test,  prob_test,  levels = c("No","Yes"), direction = "<", quiet = TRUE)
+
+cat("\nTrain AUC:", round(auc(roc_train), 4), "\n")
+cat("Test  AUC:", round(auc(roc_test),  4), "\n")
+
+# Plot 3: ROC curve
+plot(roc_test,  col = "steelblue", lwd = 2,
+     main = paste("Ridge ROC Curve — Test AUC:", round(auc(roc_test), 4)))
+plot(roc_train, col = "tomato", lwd = 2, lty = 2, add = TRUE)
+legend("bottomright", legend = c("Test","Train"),
+       col = c("steelblue","tomato"), lty = c(1,2), lwd = 2)
+
+
+# =============================================================================
+# 8. SUMMARY TABLE
+# =============================================================================
+
+results_ridge <- data.frame(
+  Metric    = c("Accuracy", "Sensitivity", "Specificity", "Precision", "F1", "AUC"),
+  Train     = c(
+    round(cm_train$overall["Accuracy"],       4),
+    round(cm_train$byClass["Sensitivity"],    4),
+    round(cm_train$byClass["Specificity"],    4),
+    round(cm_train$byClass["Pos Pred Value"], 4),
+    round(cm_train$byClass["F1"],             4),
+    round(auc(roc_train),                     4)
+  ),
+  Test      = c(
+    round(cm_test$overall["Accuracy"],        4),
+    round(cm_test$byClass["Sensitivity"],     4),
+    round(cm_test$byClass["Specificity"],     4),
+    round(cm_test$byClass["Pos Pred Value"],  4),
+    round(cm_test$byClass["F1"],              4),
+    round(auc(roc_test),                      4)
+  )
+)
+
+cat("\n=== RIDGE PERFORMANCE SUMMARY ===\n")
+print(results_ridge)
+
+# Save results for model comparison later
+cm_train -> cm_train_ridge
+cm_test  -> cm_test_ridge
+roc_train -> roc_train_ridge
+roc_test  -> roc_test_ridge
+
+```
+
+```{r}
+
+
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(pROC)
+
+
+# =============================================================================
+# 1. FIT INITIAL TREE (cp = 0 grows full unpruned tree)
+# set.seed placed here because xerror in cp table uses random sampling
+# — without this, xerror changes every run (see tutorial note)
+# =============================================================================
+
+set.seed(123)
+tree_model <- rpart(
+  mde_past_year ~ .,
+  data    = train_df,
+  method  = "class",
+  cp      = 0
+)
+
+
+# =============================================================================
+# 2. FIND BEST CP USING CROSS-VALIDATION ERROR (xerror)
+# =============================================================================
+
+# Print cp table
+printcp(tree_model)
+
+# Plot CV error vs tree size
+plotcp(tree_model, main = "Classification Tree: CV Error vs Tree Size")
+
+# Pick cp with lowest xerror
+best_cp <- tree_model$cptable[which.min(tree_model$cptable[, "xerror"]), "CP"]
+cat("\nBest cp:", round(best_cp, 6), "\n")
+
+
+# =============================================================================
+# 3. PRUNE TREE TO BEST CP
+# =============================================================================
+
+tree_pruned <- prune(tree_model, cp = best_cp)
+
+
+# =============================================================================
+# 4. PLOT THE PRUNED TREE
+# =============================================================================
+
+rpart.plot(tree_pruned,
+           type  = 4,
+           extra = 104,
+           main  = "Pruned Classification Tree: MDE Prediction")
+
+
+# =============================================================================
+# 5. PREDICTIONS
+# =============================================================================
+
+# Class labels for confusion matrix
+pred_train <- predict(tree_pruned, newdata = train_df, type = "class")
+pred_test  <- predict(tree_pruned, newdata = test_df,  type = "class")
+
+# Probabilities for AUC
+prob_train <- predict(tree_pruned, newdata = train_df, type = "prob")[, "Yes"]
+prob_test  <- predict(tree_pruned, newdata = test_df,  type = "prob")[, "Yes"]
+
+
+# =============================================================================
+# 6. PERFORMANCE METRICS
+# =============================================================================
+
+cat("\n=== IN-SAMPLE (Train) ===\n")
+cm_train <- confusionMatrix(pred_train, train_df$mde_past_year, positive = "Yes")
+print(cm_train)
+
+cat("\n=== OUT-OF-SAMPLE (Test) ===\n")
+cm_test <- confusionMatrix(pred_test, test_df$mde_past_year, positive = "Yes")
+print(cm_test)
+
+# AUC
+roc_train <- roc(train_df$mde_past_year, prob_train,
+                 levels = c("No","Yes"), direction = "<", quiet = TRUE)
+roc_test  <- roc(test_df$mde_past_year,  prob_test,
+                 levels = c("No","Yes"), direction = "<", quiet = TRUE)
+
+cat("\nTrain AUC:", round(auc(roc_train), 4), "\n")
+cat("Test  AUC:", round(auc(roc_test),  4), "\n")
+
+# ROC Curve
+plot(roc_test,  col = "steelblue", lwd = 2,
+     main = paste("Classification Tree ROC — Test AUC:", round(auc(roc_test), 4)))
+plot(roc_train, col = "tomato", lwd = 2, lty = 2, add = TRUE)
+legend("bottomright", legend = c("Test", "Train"),
+       col = c("steelblue", "tomato"), lty = c(1, 2), lwd = 2)
+
+
+# =============================================================================
+# 7. SUMMARY TABLE
+# =============================================================================
+
+results_tree <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "AUC"),
+  Train  = c(
+    round(cm_train$overall["Accuracy"],    4),
+    round(cm_train$byClass["Sensitivity"], 4),
+    round(cm_train$byClass["Specificity"], 4),
+    round(auc(roc_train),                  4)
+  ),
+  Test   = c(
+    round(cm_test$overall["Accuracy"],     4),
+    round(cm_test$byClass["Sensitivity"],  4),
+    round(cm_test$byClass["Specificity"],  4),
+    round(auc(roc_test),                   4)
+  )
+)
+
+cat("\n=== CLASSIFICATION TREE PERFORMANCE SUMMARY ===\n")
+print(results_tree)
+
+# Save for model comparison later
+cm_train -> cm_train_tree
+cm_test  -> cm_test_tree
+roc_train -> roc_train_tree
+roc_test  -> roc_test_tree
+
+```
+
+Random Forest
+
+```{r}
+library(ranger)
+library(caret)
+library(pROC)
+library(vip)
+ 
+ 
+# =============================================================================
+# 1. FIT RANDOM FOREST
+# =============================================================================
+ 
+p <- ncol(train_df) - 1   # number of predictors
+ 
+set.seed(123)
+rf_model <- ranger(
+  formula     = mde_past_year ~ .,
+  data        = train_df,
+  mtry        = floor(p / 3),
+  importance  = "impurity",
+  probability = TRUE
+)
+ 
+rf_model
+ 
+ 
+# =============================================================================
+# 2. VARIABLE IMPORTANCE PLOT
+# =============================================================================
+ 
+vip(rf_model)
+ 
+ 
+# =============================================================================
+# 3. PREDICTIONS
+# =============================================================================
+ 
+rf_pred_test  <- predict(rf_model, test_df)
+rf_pred_train <- predict(rf_model, train_df)
+ 
+prob_test  <- rf_pred_test$predictions[,  "Yes"]
+prob_train <- rf_pred_train$predictions[, "Yes"]
+ 
+# Class labels
+rf_class_test  <- factor(ifelse(prob_test  > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+rf_class_train <- factor(ifelse(prob_train > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+ 
+ 
+# =============================================================================
+# 4. CONFUSION MATRIX
+# =============================================================================
+ 
+cat("\n=== IN-SAMPLE (Train) ===\n")
+# Replace lines 669-672 with:
+cm_train <- confusionMatrix(rf_class_train, train_df$mde_past_year, positive = "Yes")
+print(cm_train)
+
+cm_test <- confusionMatrix(rf_class_test, test_df$mde_past_year, positive = "Yes")
+print(cm_test)
+ 
+ 
+# =============================================================================
+# 5. ROC AND AUC
+# =============================================================================
+ 
+roc_train <- roc(train_df$mde_past_year, prob_train,
+                 levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+roc_test  <- roc(test_df$mde_past_year,  prob_test,
+                 levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+ 
+cat("\nTrain AUC:", round(auc(roc_train), 4), "\n")
+cat("Test  AUC:", round(auc(roc_test),  4), "\n")
+ 
+plot(roc_test,  col = "steelblue", lwd = 2,
+     main = paste("Random Forest ROC — Test AUC:", round(auc(roc_test), 4)))
+plot(roc_train, col = "tomato", lwd = 2, lty = 2, add = TRUE)
+legend("bottomright", legend = c("Test", "Train"),
+       col = c("steelblue", "tomato"), lty = c(1, 2), lwd = 2)
+
+
+
+
+cm_train -> cm_train_rf
+cm_test  -> cm_test_rf
+roc_train -> roc_train_rf
+roc_test  -> roc_test_rf
+```
+
+Comparison
+
+```{r}
+comparison <- data.frame(
+  Metric        = c("Train Accuracy", "Test Accuracy", "Train AUC", "Test AUC"),
+  Ridge         = c(
+    round(cm_train_ridge$overall["Accuracy"], 8),
+    round(cm_test_ridge$overall["Accuracy"],  8),
+    round(auc(roc_train_ridge),               8),
+    round(auc(roc_test_ridge),                8)
+  ),
+  Classification_Tree          = c(
+    round(cm_train_tree$overall["Accuracy"],  8),
+    round(cm_test_tree$overall["Accuracy"],   8),
+    round(auc(roc_train_tree),                8),
+    round(auc(roc_test_tree),                 8)
+  ),
+  Random_Forest = c(
+    round(cm_train_rf$overall["Accuracy"],    8),
+    round(cm_test_rf$overall["Accuracy"],     8),
+    round(auc(roc_train_rf),                  8),
+    round(auc(roc_test_rf),                   8)
+  )
+)
+ 
+print(comparison)
+```
+
+
+
