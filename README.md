@@ -1,2 +1,2 @@
 # projectPredictiveML
-Self predictive ML projects
+Group predictive ML projects
